@@ -1,10 +1,8 @@
 import asyncio
-import asyncpg
 from datetime import datetime
 from aiohttp import ClientSession
 from more_itertools import chunked
-
-from sqlalchemy import Integer, String, Column, ARRAY
+from sqlalchemy import Integer, String, Column
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,12 +11,15 @@ import config
 
 engine = create_async_engine(config.PG_DSN_ALC, echo=True)
 Base = declarative_base(bind=engine)
+DbSession = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 URL = 'https://swapi.dev/api/people/'
 
-MAX = 10
-PARTITION = 2
-SLEEP_TIME = 1
+MAX = 100
+PARTITION = 10
+
+field_list = ["gender", "hair_color", "name", "skin_color", "birth_year", "eye_color", "height", "mass"]
+field_list_url = ["species", "starships", "vehicles"]
 
 
 class People(Base):
@@ -27,7 +28,7 @@ class People(Base):
     id = Column(Integer, primary_key=True)
     birth_year = Column(String(32))
     eye_color = Column(String(32))
-    films = Column(ARRAY(String))
+    films = Column(String)
     gender = Column(String(32))
     hair_color = Column(String(32))
     height = Column(String(32))
@@ -35,25 +36,47 @@ class People(Base):
     mass = Column(String(32))
     name = Column(String(64))
     skin_color = Column(String(64))
-    species = Column(ARRAY(String))
-    starships = Column(ARRAY(String))
-    vehicles = Column(ARRAY(String))
+    species = Column(String)
+    starships = Column(String)
+    vehicles = Column(String)
 
 
-async def get_async_session(
-        drop: bool = False, create: bool = False
-):
-    async with engine.begin() as conn:
-        if drop:
-            await conn.run_sync(Base.metadata.drop_all)
-        if create:
-            print(1)
-            await conn.run_sync(Base.metadata.create_all)
-    async_session_maker = sessionmaker(
-        engine, expire_on_commit=False, class_=AsyncSession
-    )
+def get_id(url: str):
+    return int(url.split("/")[-2])
 
-    return async_session_maker
+
+async def get_hero_name(session, home_url):
+    async with session.get(home_url) as response:
+        return await response.json()
+
+
+async def get_names(session, urls):
+    tasks = [asyncio.create_task(get_hero_name(session, url)) for url in urls]
+    for task in tasks:
+        name = await task
+        yield name
+
+
+async def urls_to_names(session, urls, obj_keyname="name"):
+    result_list = []
+    async for name in get_names(session, urls):
+        result_list.append(name[obj_keyname])
+    return ','.join(result_list)
+
+
+async def specific_person(session, person):
+    task = asyncio.create_task(get_hero_name(session, person["homeworld"]))
+    name = await task
+    res_person = {
+        "id": get_id(person["url"]),
+        "homeworld": name["name"]
+    }
+    for key in field_list:
+        res_person[key] = person[key]
+    for key in field_list_url:
+        res_person[key] = await urls_to_names(session, person[key])
+    res_person["films"] = await urls_to_names(session, person["films"], "title")
+    return res_person
 
 
 async def get_person(person_id, session):
@@ -69,44 +92,17 @@ async def get_people(all_ids, partition, session):
             yield task_result
 
 
-async def insert_people(pool: asyncpg.Pool, people_list):
-    # query = 'INSERT INTO people (birth_year, eye_color, films, gender, hair_color, height, homeworld, mass, name, skin_color, species, starships, vehicles) ' \
-    #         'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)'
-    # query = 'INSERT INTO people (birth_year, eye_color, films, gender, hair_color, height, homeworld, mass, name, skin_color, species, starships, vehicles) ' \
-    #         'VALUES ({people_list[0]}, {people_list[1]}, {people_list[2]}, {people_list[3]}, {people_list[4]}, {people_list[5]}, {people_list[6]}, {people_list[7]}, {people_list[8]}, {people_list[9]}, {people_list[10]}, {people_list[11]}, {people_list[12]})'
-    # query = 'INSERT INTO people (birth_year, eye_color, films, gender, hair_color, height, homeworld, mass, name, skin_color, species, starships, vehicles) VALUES (%(birth_year)s, %(eye_color)s, %(films)s, %(gender)s, %(hair_color)s, %(height)s, %(homeworld)s, %(mass)s, %(name)s, %(skin_color)s, %(species)s, %(starships)s, %(vehicles)s)'
-    # query = """INSERT INTO people (birth_year, eye_color, films, gender, hair_color, height, homeworld, mass, name, skin_color, species, starships, vehicles) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-    query = "INSERT INTO people (birth_year, eye_color, films, gender, hair_color, height, homeworld, mass, name, skin_color, species, starships, vehicles) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.executemany(query, people_list)
-
-
 async def main():
-    session = await get_async_session(False, True)
-    db_tasks = []
     async with ClientSession() as http_session:
-        pool = await asyncpg.create_pool(config.PG_DSN, min_size=2, max_size=2)
         async for people in get_people(range(1, MAX + 1), PARTITION, http_session):
-            # print(people)
-            # async with session() as db_session:
-            #     async for result in people:
-            #         db_session.add(People)
-            #     await db_session.commit()
-            # heroes_list = [people["birth_year"], people["eye_color"], people["films"], people["films"],
-            #                people["hair_color"], people["height"], people["homeworld"], people["mass"],
-            #                people["name"], people["skin_color"], people["species"], people["starships"],
-            #                people["vehicles"]]
-            # print(heroes_list)
-            # await insert_people(pool, list(people))
-            db_tasks.append(asyncio.create_task(insert_people(pool, list(people))))
+            if "name" in people.keys():
+                person = await specific_person(http_session, people)
+                async with DbSession() as db_session:
+                    db_session.add(People(**person))
+                    await db_session.commit()
 
-            await asyncio.gather(*db_tasks)
-            await pool.close()
 
-            for task in db_tasks:
-                await task
-
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 start = datetime.now()
 asyncio.run(main())
 print(datetime.now() - start)
